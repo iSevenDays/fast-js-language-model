@@ -1,22 +1,31 @@
+# 287 line test tokenizer. Ensure that all tokens are present in vec.vec
+# for book_path in books:
+#     full_path = os.path.join('./data', book_path)
+#     with open(full_path, 'r') as f:
+#         book = f.read()
+#     book = tokenizer.encode(book)
+
+#     for token in book:
+#         assert convert(token) != empty_vec, f"token {token} hasn't been found in w2v: {w2v}"
+
+
 import tensorflow as tf
 import tiktoken
 import os
 import random
 import numpy as np
 import math
-import os
 from datetime import datetime
 import time
-import numpy as np
 import json
 import logging
-import pickle 
+import pickle
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-use_gpu = True
+use_gpu = False
 if not use_gpu:
     # seems to be better for M1 Macbook with the current architecture
     tf.config.experimental.set_visible_devices([], 'GPU')
@@ -27,6 +36,9 @@ checkpoint_data = {
     'other_data': None  # You can add other data if needed
 }
 
+def setattr_time(epoch_start_time):
+    setattr(time, 'epoch_start_time', epoch_start_time)
+
 if os.path.exists('checkpoint.txt'):
     with open('checkpoint.txt', 'r') as file:
         checkpoint_data = json.load(file)
@@ -35,13 +47,13 @@ last_epoch = checkpoint_data['last_epoch']
 
 
 cfg = {
-    'sequenceSize': 1024,
-    'dimension': 1024,
+    'sequenceSize': 256,
+    'dimension': 256,
     'arrayDimension': 8,
     'predictSteps': 8,
-    'batchSize': 64#4096 * 2
+    'batchSize': 4#4096 * 2
 }
-learning_rate = 0.0005 * 2
+learning_rate = 0.0005
 
 wandb_log = False  # disabled by default
 wandb_project = "fast-model"
@@ -144,7 +156,7 @@ class TransformerLayer(tf.keras.layers.Layer):
         flatten_concat_attention = tf.reshape(concat_attention, [batch_size * self.pad_size, -1])
         flatten_attention = tf.matmul(flatten_concat_attention, self.dense_weight) + self.dense_bias
         attention = tf.reshape(flatten_attention, [batch_size, self.pad_size, -1])
-        print(f"Shape of attention: {attention.shape}")
+        logging.debug(f"Shape of attention: {attention.shape}")
 
         normalized_latent = scaled_input + tf.squeeze(self.random_id_att) * attention
         flatten_normalized_latent = tf.reshape(normalized_latent, [batch_size * self.pad_size, -1])
@@ -157,7 +169,7 @@ class TransformerLayer(tf.keras.layers.Layer):
 
         output = normalized_latent + tf.squeeze(self.random_id_ff) * dff2
         output = tf.reshape(output, [batch_size, self.pad_size, self.depth])
-
+        logging.debug("Return output")
         if self.pool:
             return tf.reduce_mean(output, axis=1)
         else:
@@ -286,16 +298,6 @@ def hash_based_split(filenames, test_split=0.2):
 train_books, val_books = hash_based_split(books, test_split=0.2)
 logging.info(f"Found train books: {len(train_books)}, test books: {len(val_books)}")
 
-# test tokenizer. Ensure that all tokens are present in vec.vec
-# for book_path in books:
-#     full_path = os.path.join('./data', book_path)
-#     with open(full_path, 'r') as f:
-#         book = f.read()
-#     book = tokenizer.encode(book)
-
-#     for token in book:
-#         assert convert(token) != empty_vec, f"token {token} hasn't been found in w2v: {w2v}"
-
 setx = []
 last_batch = []
 def run():
@@ -363,7 +365,6 @@ def run():
                 n += 1
                 
                 # Check if setx has enough data for a batch
-                logging.debug(f'len setx: {len(setx)}')
                 if len(setx) == cfg['batchSize']:
                     tx1 = np.array([item[0] for item in setx])
                     ty1 = np.array([item[1] for item in setx])
@@ -373,13 +374,14 @@ def run():
                     yield tx1, ty1
 
     def on_epoch_end(epoch, logs):
+        print("on_epoch_end")
         logging.debug("on_epoch_end")
         # Calculate dt - the time taken for the epoch
         dt = time.time() - time.epoch_start_time
         # Estimate MFU
         logging.debug("will estimate_mfu")
         fwdbwd_per_iter = 1 # Assuming one forward and backward pass per iteration
-        mfu = estimate_mfu(model, fwdbwd_per_iter, dt)
+        # mfu = estimate_mfu(model, fwdbwd_per_iter, dt)
 
         if not last_batch:
             logging.warning("last_batch is empty, skipping this epoch end.")
@@ -407,8 +409,6 @@ def run():
             logging.info('--------------------------------PREDICT----------------------------------------')
             logging.info(tokenizer.decode(list(map(lambda s: int(reverser(s)), a))))
 
-        mfu = estimate_mfu(model, fwdbwd_per_iter, dt)
-
         if wandb_log:
             try:
                 wandb.log(
@@ -419,7 +419,7 @@ def run():
                         "loss/val": logs["val_loss"],
                         "accuracy": logs["accuracy"],
                         "lr": learning_rate,
-                        "mfu": mfu * 100,  # convert to percentage
+                        "mfu": 0#mfu * 100,  # convert to percentage
                     }
                 )
             except Exception as e:
@@ -435,12 +435,15 @@ def run():
         tf.TensorSpec(shape=(cfg['batchSize'], cfg['sequenceSize'], cfg['predictSteps']), dtype=tf.float32)
     ))
     num_batches_per_epoch = len(train_books) // cfg['batchSize']
-    steps_per_epoch=num_batches_per_epoch * 3
+    steps_per_epoch=num_batches_per_epoch
     logging.info(f'steps_per_epoch: {steps_per_epoch}')
-    model.fit(train_dataset, epochs=len(train_books) // 128, steps_per_epoch=12, validation_data=val_dataset, callbacks=[
+    steps_per_epoch = 12
+    model.fit(train_dataset, epochs=len(train_books) // 128,
+              steps_per_epoch=steps_per_epoch, 
+              validation_data=val_dataset, callbacks=[
                     tf.keras.callbacks.LambdaCallback(
-    on_epoch_begin=lambda epoch, logs: setattr(time, 'epoch_start_time', time.time()),
-    on_epoch_end=on_epoch_end)
+        on_epoch_begin=lambda epoch, logs: setattr_time(time.time()),
+        on_epoch_end=on_epoch_end)
     ])
 
 run()
