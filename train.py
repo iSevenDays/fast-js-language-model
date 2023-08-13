@@ -9,6 +9,12 @@ from datetime import datetime
 import time
 import numpy as np
 import json
+import logging
+import pickle 
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 use_gpu = True
 if not use_gpu:
@@ -29,20 +35,37 @@ last_epoch = checkpoint_data['last_epoch']
 
 
 cfg = {
-    'sequenceSize': 512,
-    'dimension': 512,
+    'sequenceSize': 1024,
+    'dimension': 1024,
     'arrayDimension': 8,
     'predictSteps': 8,
-    'batchSize': 4096
+    'batchSize': 64#4096 * 2
 }
-learning_rate = 0.005
+learning_rate = 0.0005 * 2
 
 wandb_log = False  # disabled by default
 wandb_project = "fast-model"
-wandb_run_name = "run_combined" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+wandb_run_name = f"run_combined_{cfg['sequenceSize']}_{cfg['dimension']} {datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
 if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=cfg, resume=True)
+
+
+max_iters = 10000
+initial_learning_rate = learning_rate
+decay_steps = max_iters - checkpoint_data['last_epoch']
+decay_rate = 0.96
+
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate,
+    decay_steps=decay_steps,
+    decay_rate=decay_rate,
+    staircase=True)  # If True, decay the learning rate at discrete intervals
+
+# WARNING:absl:At this time, the v2.11+ optimizer `tf.keras.optimizers.Adam` runs slowly on M1/M2 Macs, please use the legacy Keras optimizer instead, located at `tf.keras.optimizers.legacy.Adam`.
+optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=lr_schedule)
+
+#optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
 class TransformerLayer(tf.keras.layers.Layer):
     def __init__(self, num_heads=8, pad_size=None, depth=None, pool=None, **kwargs):
@@ -82,13 +105,13 @@ class TransformerLayer(tf.keras.layers.Layer):
 
     def call(self, inputs):
         K = tf
-        print("Shape of inputs:", inputs.shape)
+        # logging.debug(f"Shape of inputs: {inputs.shape}")
         batch_size = tf.shape(inputs)[0]
         
         flat_input = tf.reshape(inputs, [self.pad_size * batch_size, -1])
         flat_scaled_input = tf.matmul(flat_input, self.input_dense_weight) + self.input_dense_bias
         scaled_input = tf.reshape(flat_scaled_input, [batch_size, self.pad_size, -1])
-        print("Shape of scaledInput:", scaled_input.shape)
+        # logging.debug("Shape of scaledInput:", scaled_input.shape)
 
         flat_query = tf.matmul(flat_scaled_input, self.query_dense_weight) + self.query_dense_bias
         flat_key = tf.matmul(flat_scaled_input, self.key_dense_weight) + self.key_dense_bias
@@ -101,16 +124,16 @@ class TransformerLayer(tf.keras.layers.Layer):
         query_t = tf.transpose(tf.reshape(query, [batch_size, -1, self.num_heads, self.depth // self.num_heads]), [0, 2, 1, 3])
         key_t = tf.transpose(tf.reshape(key, [batch_size, -1, self.num_heads, self.depth // self.num_heads]), [0, 2, 1, 3])
         value_t = tf.transpose(tf.reshape(value, [batch_size, -1, self.num_heads, self.depth // self.num_heads]), [0, 2, 1, 3])
-        print("Shape of queryT:", query_t.shape)
-        print("Shape of keyT:", key_t.shape)
-        print("Shape of valueT:", value_t.shape)
+        logging.debug(f"Shape of queryT: {query_t.shape}")
+        logging.debug(f"Shape of keyT: {key_t.shape}")
+        logging.debug(f"Shape of valueT: {value_t.shape}")
 
         matmul_qk = tf.matmul(query_t, key_t, transpose_b=True)
         logits = matmul_qk / tf.sqrt(tf.cast(self.depth, tf.float32))
-        print("Shape of logits before addition:", logits.shape)
+        logging.debug(f"Shape of logits before addition: {logits.shape}")
         
         to_broadcast_mask = tf.ones([batch_size, self.num_heads, self.pad_size, self.pad_size])
-        print("Shape of to_broadcast_mask:", to_broadcast_mask.shape)
+        logging.debug(f"Shape of to_broadcast_mask: {to_broadcast_mask.shape}")
         logits += (1.0 - to_broadcast_mask) * -1e9
 
         attention_weights = tf.nn.sigmoid(logits) * tf.nn.tanh(logits)
@@ -121,7 +144,7 @@ class TransformerLayer(tf.keras.layers.Layer):
         flatten_concat_attention = tf.reshape(concat_attention, [batch_size * self.pad_size, -1])
         flatten_attention = tf.matmul(flatten_concat_attention, self.dense_weight) + self.dense_bias
         attention = tf.reshape(flatten_attention, [batch_size, self.pad_size, -1])
-        print("Shape of attention:", attention.shape)
+        print(f"Shape of attention: {attention.shape}")
 
         normalized_latent = scaled_input + tf.squeeze(self.random_id_att) * attention
         flatten_normalized_latent = tf.reshape(normalized_latent, [batch_size * self.pad_size, -1])
@@ -236,13 +259,32 @@ empty_vec = [0] * 8
 def convert(n):
     vec = w2v.get(str(n), empty_vec)
     if vec == empty_vec:
-        print(f"Token {n} not found in w2v dictionary!")
+        logging.error(f"Token {n} not found in w2v dictionary!")
     return [float(i) for i in vec]
 
 assert convert(11) != empty_vec
 
 books = [file for file in os.listdir('./data') if file.endswith('.txt') and not file.startswith('.DS_Store')]
 random.shuffle(books)
+
+# Split into train and test based on hashes derived from the filenames
+# in this way, we can add/remove new files and train/test files will not be mixed
+import hashlib
+
+def hash_based_split(filenames, test_split=0.2):
+    train_files = []
+    test_files = []
+    for filename in filenames:
+        hash_val = hashlib.md5(filename.encode()).hexdigest()
+        hash_num = int(hash_val, 16) / float(1 << 128)
+        if hash_num < test_split:
+            test_files.append(filename)
+        else:
+            train_files.append(filename)
+    return train_files, test_files
+
+train_books, val_books = hash_based_split(books, test_split=0.2)
+logging.info(f"Found train books: {len(train_books)}, test books: {len(val_books)}")
 
 # test tokenizer. Ensure that all tokens are present in vec.vec
 # for book_path in books:
@@ -260,15 +302,15 @@ def run():
     input = tf.keras.layers.Input(shape=(cfg['sequenceSize'], cfg['predictSteps']))
 
     x = tf.keras.layers.Permute((2, 1))(input)
-    print("Shape of x after permute:", x.shape)
+    logging.debug(f"Shape of x after permute: {x.shape}")
     skip = x
 
     x = tf.keras.layers.Conv1D(filters=cfg['dimension'], kernel_size=1, strides=1, padding="same", activation="mish")(x)
-    print("Shape of x after Conv1D:", x.shape)
+    logging.debug(f"Shape of x after Conv1D: {x.shape}")
     x = TransformerLayer(depth=cfg['dimension'], num_heads=4, pad_size=cfg['arrayDimension'])(x)
-    print("Shape of x after first TransformerLayer:", x.shape)
+    logging.debug(f"Shape of x after first TransformerLayer: {x.shape}")
     x = TransformerLayer(depth=cfg['sequenceSize'], num_heads=4, pad_size=cfg['arrayDimension'])(x)
-    print("Shape of x after second TransformerLayer:", x.shape)
+    logging.debug(f"Shape of x after second TransformerLayer: {x.shape}")
 
     x3a = tf.keras.layers.Permute((2, 1))(x)
     x1 = tf.keras.layers.Dense(units=cfg['arrayDimension'], activation="linear")(x3a)
@@ -276,43 +318,52 @@ def run():
     # Check if saved model exists
     if os.path.exists('./models/llm'):
         model = tf.keras.models.load_model('./models/llm')
-        print("Loaded model from disk.")
+        logging.info("Loaded model from disk.")
     else:
         model = tf.keras.Model(inputs=[input], outputs=[x1])
-        model.compile(loss=tf.keras.losses.Huber(), metrics=['accuracy'], optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate))
+        model.compile(loss=tf.keras.losses.Huber(), metrics=['accuracy'], optimizer=optimizer)
     model.summary()
 
-    for book_path in books:
-        full_path = os.path.join('./data', book_path)
-        with open(full_path, 'r') as f:
-            book = f.read()
 
-        book = tokenizer.encode(book)
+    def generator(book_paths):
+        global setx
+        global last_batch
 
-        def generator():
-            global setx
-            global last_batch
+        for book_path in book_paths:
+            
+            try:
+                tokenized_book_path = os.path.join('./tokenized_books', os.path.basename(book_path) + '.tokenized.pkl')
+                with open(tokenized_book_path, 'rb') as f:
+                    book = pickle.load(f)
+            except:
+                logging.warning(f'Could not load tokenized book {book_path}, will perform tokenization')
+                full_path = os.path.join('./data', book_path)
+                with open(full_path, 'r') as f:
+                    book = f.read()
+                book = tokenizer.encode(book)
+        
             setx = []
             n = 0
             for _ in range(len(book) // cfg['batchSize']):
                 for k in range(cfg['batchSize']):
                     pool_slice = book[n + k: k + n + cfg['sequenceSize'] + cfg['predictSteps']]
-                    # print(f'len pool_slise: {len(pool_slice)}')
-                    # print(f'pool size first five elements: {pool_slice[:5]}')
+                    # logging.debug(f'len pool_slise: {len(pool_slice)}')
+                    # logging.debug(f'pool size first five elements: {pool_slice[:5]}')
                     xs = pool_slice[:cfg['sequenceSize']]
                     ys = pool_slice[-cfg['sequenceSize']:]
 
-                    # print(f'xs shape: {np.array(xs).shape}, ys shape: {np.array(ys).shape}')
-                    # print(f'xs start: {xs[:10]}, ys start: {ys[:10]}')
+                    # logging.debug(f'xs shape: {np.array(xs).shape}, ys shape: {np.array(ys).shape}')
+                    # logging.debug(f'xs start: {xs[:10]}, ys start: {ys[:10]}')
                     
                     xs_converted = np.array(list(map(convert, xs)), dtype=np.float32)
                     ys_converted = np.array(list(map(convert, ys)), dtype=np.float32)
                                             
                     setx.append([xs_converted, ys_converted])
-                    # print(f'xs_converted: {xs_converted}, ys_converted: {ys_converted}')
+                    # logging.debug(f'xs_converted len: {len(xs_converted)}, ys_converted len: {len(ys_converted)}')
                 n += 1
                 
                 # Check if setx has enough data for a batch
+                logging.debug(f'len setx: {len(setx)}')
                 if len(setx) == cfg['batchSize']:
                     tx1 = np.array([item[0] for item in setx])
                     ty1 = np.array([item[1] for item in setx])
@@ -321,68 +372,75 @@ def run():
                     setx = []
                     yield tx1, ty1
 
+    def on_epoch_end(epoch, logs):
+        logging.debug("on_epoch_end")
+        # Calculate dt - the time taken for the epoch
+        dt = time.time() - time.epoch_start_time
+        # Estimate MFU
+        logging.debug("will estimate_mfu")
+        fwdbwd_per_iter = 1 # Assuming one forward and backward pass per iteration
+        mfu = estimate_mfu(model, fwdbwd_per_iter, dt)
 
+        if not last_batch:
+            logging.warning("last_batch is empty, skipping this epoch end.")
+            return
+        model.save('./models/llm')
 
-        dataset = tf.data.Dataset.from_generator(generator, output_signature=(
-            tf.TensorSpec(shape=(cfg['batchSize'], cfg['sequenceSize'], cfg['predictSteps']), dtype=tf.float32),
-            tf.TensorSpec(shape=(cfg['batchSize'], cfg['sequenceSize'], cfg['predictSteps']), dtype=tf.float32)
-        ))
+        checkpoint_data['last_epoch'] = last_epoch + epoch
 
-        epoch_start_time = time.time()
-        def on_epoch_end(epoch, logs):
-            global epoch_start_time
-            # Calculate dt - the time taken for the epoch
-            dt = time.time() - time.epoch_start_time
-            # Estimate MFU
-            fwdbwd_per_iter = 1 # Assuming one forward and backward pass per iteration
-            mfu = estimate_mfu(model, fwdbwd_per_iter, dt)
+        with open('checkpoint.txt', 'w') as file:
+            json.dump(checkpoint_data, file)
 
-            if not last_batch:
-                print("last_batch is empty, skipping this epoch end.")
-                return
-            model.save('./models/llm')
+        r = random.randint(0, len(last_batch) - 1)
+        s = [last_batch[r]]
+        tx11 = np.array([item[0] for item in s])
 
-            checkpoint_data['last_epoch'] = last_epoch + epoch
+        show_test_output = True # epoch % 10 == 0
 
-            with open('checkpoint.txt', 'w') as file:
-                json.dump(checkpoint_data, file)
-
-            r = random.randint(0, len(last_batch) - 1)
-            s = [last_batch[r]]
-            tx11 = np.array([item[0] for item in s])
+        if show_test_output:
             res = model.predict(tx11)
             a = res[0]
-            print('---------------------------------INPUT-----------------------------------------')
-            print(reparse(last_batch[r][0]))
-            print('---------------------------------REAL-----------------------------------------')
-            print(reparse(last_batch[r][1]))
-            print('--------------------------------PREDICT----------------------------------------')
-            print(tokenizer.decode(list(map(lambda s: int(reverser(s)), a))))
+            logging.info('---------------------------------INPUT-----------------------------------------')
+            logging.info(reparse(last_batch[r][0]))
+            logging.info('---------------------------------REAL-----------------------------------------')
+            logging.info(reparse(last_batch[r][1]))
+            logging.info('--------------------------------PREDICT----------------------------------------')
+            logging.info(tokenizer.decode(list(map(lambda s: int(reverser(s)), a))))
 
-            mfu = estimate_mfu(model, fwdbwd_per_iter, dt)
+        mfu = estimate_mfu(model, fwdbwd_per_iter, dt)
 
-            if wandb_log:
-                try:
-                    wandb.log(
-                        {
-                            "iter": last_epoch + epoch,
-                            "tokens": (last_epoch + epoch) * len(book) // 128,
-                            "loss/train": logs["loss"],
-                            "accuracy": logs["accuracy"],
-                            "lr": learning_rate,
-                            "mfu": mfu * 100,  # convert to percentage
-                        }
-                    )
-                except Exception as e:
-                    print(f"logging to wandb failed: {e}")
+        if wandb_log:
+            try:
+                wandb.log(
+                    {
+                        "iter": last_epoch + epoch,
+                        "tokens": (last_epoch + epoch) * len(train_books) // 128,
+                        "loss/train": logs["loss"],
+                        "loss/val": logs["val_loss"],
+                        "accuracy": logs["accuracy"],
+                        "lr": learning_rate,
+                        "mfu": mfu * 100,  # convert to percentage
+                    }
+                )
+            except Exception as e:
+                logging.error(f"logging to wandb failed: {e}")
 
-        # num_batches_per_epoch = len(book) // cfg['batchSize']
-        # steps_per_epoch=num_batches_per_epoch
-        model.fit(dataset, epochs=len(book) // 128, 
-                  callbacks=[
-                      tf.keras.callbacks.LambdaCallback(
-        on_epoch_begin=lambda epoch, logs: setattr(time, 'epoch_start_time', time.time()),
-        on_epoch_end=on_epoch_end)
-        ])
+    
+    train_dataset = tf.data.Dataset.from_generator(lambda: generator(train_books), output_signature=(
+        tf.TensorSpec(shape=(cfg['batchSize'], cfg['sequenceSize'], cfg['predictSteps']), dtype=tf.float32),
+        tf.TensorSpec(shape=(cfg['batchSize'], cfg['sequenceSize'], cfg['predictSteps']), dtype=tf.float32)
+    ))
+    val_dataset = tf.data.Dataset.from_generator(lambda: generator(val_books), output_signature=(
+        tf.TensorSpec(shape=(cfg['batchSize'], cfg['sequenceSize'], cfg['predictSteps']), dtype=tf.float32),
+        tf.TensorSpec(shape=(cfg['batchSize'], cfg['sequenceSize'], cfg['predictSteps']), dtype=tf.float32)
+    ))
+    num_batches_per_epoch = len(train_books) // cfg['batchSize']
+    steps_per_epoch=num_batches_per_epoch * 3
+    logging.info(f'steps_per_epoch: {steps_per_epoch}')
+    model.fit(train_dataset, epochs=len(train_books) // 128, steps_per_epoch=12, validation_data=val_dataset, callbacks=[
+                    tf.keras.callbacks.LambdaCallback(
+    on_epoch_begin=lambda epoch, logs: setattr(time, 'epoch_start_time', time.time()),
+    on_epoch_end=on_epoch_end)
+    ])
 
 run()
